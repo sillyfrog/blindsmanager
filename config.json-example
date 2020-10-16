@@ -1,0 +1,22 @@
+{
+  "host": "mqtt.server",
+  "blinds": [
+    {
+      "name": "Lounge 1",
+      "remote_id": "0xf515",
+      "time_open": 31,
+      "time_close": 27,
+      "topic": "lounge-1",
+      "homie_id": "blinds-controller",
+      "device_class": "awning"
+    },
+    {
+      "name": "Lounge 2",
+      "remote_id": "0xd9ef",
+      "time_open": 31,
+      "time_close": 27,
+      "topic": "lounge-2",
+      "homie_id": "blinds-controller"
+    }
+  ]
+}

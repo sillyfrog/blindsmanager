@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+
+import paho.mqtt.client
+import time
+import json
+import threading
+import queue
+
+
+HOST = None
+
+DOWN = "down"
+UP = "up"
+STOP = "stop"
+LIMIT = "limit"
+DIRECTION = "direction"
+PAIR = "pair"
+
+COMMANDS = [DOWN, UP, STOP, LIMIT, DIRECTION]
+
+FROM_REMOTE = "fromremote"
+FROM_MQTT = "frommqtt"
+
+HOMIE_SEND_DELAY = 0.5
+
+HOMIE_STATE_KEYS = {
+    "$homie": "Homie ESP Version",
+    "$name": "Device Name",
+    "$mac": "MAC Address",
+    "$localip": "Local IP",
+    "$fw/name": "Firmware Name",
+    "$fw/version": "Firmware Version",
+    "$implementation": "Processor",
+    "$implementation/version": "Homie Implementation",
+    "$implementation/ota/enabled": "OTA Enabled",
+    "$stats/uptime": "Uptime",
+}
+
+# Approximate frequency to publish state updates
+STATE_PUBLISH_FREQUENCY = 300
+
+
+def blindkey(remote_id, channel):
+    """Makes a consistent tuple to use as a key for a given remote_id and channel"""
+    if type(remote_id) == str:
+        remote_id = int(remote_id, 16)
+    if type(channel) == str:
+        channel = int(channel)
+    return (remote_id, channel)
+
+
+def parsepayload(payload):
+    """Parse an MQTT payload, returning a tuple
+
+    (command, remote_id, channel)
+    """
+    command, remote_id, channel = payload.strip().split(",")
+    command = command.lower()
+    if command not in COMMANDS:
+        raise ValueError(f"Invalid command: {command}")
+    remote_id = int(remote_id, 16)
+    channel = int(channel)
+    return command, remote_id, channel
+
+
+def logerror(msg):
+    print("ERROR!: " + msg)
+
+
+class Blind:
+    def __init__(self, config):
+        self.queue = queue.SimpleQueue()
+        self.position = 50
+        self.action = STOP
+        self.target_position = None
+        self.distance_sec_open = 100 / config["time_open"]
+        self.distance_sec_close = 100 / config["time_close"]
+        self.homie_id = config["homie_id"]
+        self.name = config["name"]
+        self.remote_id = int(config["remote_id"], 16)
+        self.channel = int(config.get("channel", 1))
+        self.device_class = config.get("device_class", "shade")
+        self.topic = config["topic"]
+
+    def run(self, manager):
+        self.manager = manager
+        self.thread = threading.Thread(target=self.runner, daemon=True)
+        self.thread.start()
+
+    def runner(self):
+        while 1:
+            dopublish = False
+            sendstop = False
+            try:
+                if self.action == STOP:
+                    timeout = None
+                else:
+                    timeout = 1
+                source, command = self.queue.get(timeout=timeout)
+            except queue.Empty:
+                source = None
+
+            if source == FROM_REMOTE:
+                # Got a command from the remote, act on it
+                dopublish = True
+                if command == STOP:
+                    if self.action != STOP:
+                        self.action = STOP
+                        self.target_position = None
+                elif command in (UP, DOWN):
+                    self.action = command
+
+            elif source == FROM_MQTT:
+                if command is None:
+                    sendstop = True
+                else:
+                    percentage = int(command)
+                    if percentage == 100 or percentage > self.position:
+                        self.sendcommand(UP)
+                        self.action = UP
+                    elif percentage == 0 or percentage < self.position:
+                        self.sendcommand(DOWN)
+                        self.action = DOWN
+                    else:
+                        sendstop = True
+
+            if self.action == UP:
+                dopublish = True
+                self.position += self.distance_sec_open
+                if self.target_position is not None:
+                    if self.position >= self.target_position:
+                        self.position = self.target_position
+                        self.action = STOP
+                        if self.target_position != 100:
+                            sendstop = True
+                        self.target_position = None
+                elif self.position >= 100:
+                    self.position = 100
+                    self.action = STOP
+                    self.target_position = None
+            elif self.action == DOWN:
+                dopublish = True
+                self.position -= self.distance_sec_close
+                if self.target_position is not None:
+                    if self.position <= self.target_position:
+                        self.position = self.target_position
+                        self.action = STOP
+                        if self.target_position != 0:
+                            sendstop = True
+                        self.target_position = None
+                elif self.position <= 0:
+                    self.position = 0
+                    self.action = STOP
+
+            if sendstop:
+                self.sendcommand(STOP)
+                self.action = STOP
+                self.target_position = None
+            if dopublish:
+                self.publish()
+
+    def publish(self):
+        self.manager.publishblinds(self.topic, self.position)
+
+    def gotremotecommand(self, command):
+        self.queue.put((FROM_REMOTE, command))
+
+    def gotmqttcommand(self, percentage):
+        """Got a command from MQTT, typically a percentag to open to.
+
+        If percentage is None, this is treated as STOP"""
+        if percentage is None:
+            self.queue.put((FROM_MQTT, None))
+            self.target_position = None
+            return
+        if percentage >= 100:
+            percentage = 100
+        elif percentage <= 0:
+            percentage = 0
+        self.target_position = percentage
+        self.queue.put((FROM_MQTT, percentage))
+
+    def sendcommand(self, command):
+        # Get the homie_id, and build the command to send
+        self.manager.publishhomie(
+            self.homie_id, f"{command.upper()},{hex(self.remote_id)},{self.channel}"
+        )
+
+    def hassconfig(self):
+        """Return a JSON dict of the configuration for this cover.
+
+        This can be used to broadcast via MQTT the configuration to Home Assistant.
+        """
+        config = {
+            "name": self.name,
+            "device_class": self.device_class,
+            "position_topic": f"blinds/{self.topic}/position",
+            "set_position_topic": f"blinds/{self.topic}/position/set",
+            "command_topic": f"blinds/{self.topic}/command/set",
+            "availability_topic": f"homie/{self.homie_id}/$online",
+            "payload_available": "true",
+            "payload_not_available": "false",
+            "unique_id": f"blinds_{self.topic}",
+            "device": {"identifiers": [self.homie_id]},
+            "json_attributes_topic": f"blinds/homie/{self.homie_id}/state",
+        }
+        return config
+
+
+class BlindManager:
+    def __init__(self, config):
+        self._config = config
+        self.blinds = {}
+        self.blindsbytopic = {}
+        self.homie_ids = set()
+        self.homie_state = {}
+        for blindconf in config["blinds"]:
+            self.homie_ids.add(blindconf["homie_id"])
+            channel = blindconf.get("channel", 1)
+            remote_id = blindconf["remote_id"]
+            if type(remote_id) == str:
+                remote_id = int(remote_id, 16)
+            blind = Blind(blindconf)
+            self.blinds[blindkey(remote_id, channel)] = blind
+            self.blindsbytopic[blindconf["topic"]] = blind
+        for homie_id in self.homie_ids:
+            self.homie_state[homie_id] = {}
+        self.publishqueue = queue.SimpleQueue()
+        self.next_state_publish = time.time() + STATE_PUBLISH_FREQUENCY
+
+    def run(self):
+        self.client = paho.mqtt.client.Client()
+        self.client.on_connect = self.onmqttconnect
+        self.client.on_message = self.onmqttmessage
+        self.client.connect(self._config["host"])
+        self.client.loop_start()
+        # Start all of the blind instances
+        for blind in self.blinds.values():
+            blind.run(self)
+            # Publish the HA config
+            self.client.publish(
+                f"homeassistant/cover/blinds/{blind.topic}/config",
+                json.dumps(blind.hassconfig()),
+                retain=True,
+            )
+        for homie_id in self.homie_ids:
+            self.client.publish(
+                f"homeassistant/sensor/blinds/{homie_id}/config",
+                json.dumps(
+                    {
+                        "name": f"Blind controller status ({homie_id})",
+                        "state_topic": f"homie/{homie_id}/$stats/signal",
+                        "availability_topic": f"homie/{homie_id}/$online",
+                        "payload_available": "true",
+                        "payload_not_available": "false",
+                        "json_attributes_topic": f"blinds/homie/{homie_id}/state",
+                        "unit_of_measurement": "%",
+                        "icon": "mdi:information-outline",
+                        "unique_id": f"status_{homie_id}",
+                        "device": {
+                            "identifiers": [homie_id],
+                            "name": f"Blinds Controller ({homie_id})",
+                        },
+                    }
+                ),
+                retain=True,
+            )
+
+        # Publish incoming commands, ratelimiting calls to the homie queue
+        homiedelayed = []
+        lasthomiesend = 0
+        while 1:
+            try:
+                if homiedelayed:
+                    timeout = HOMIE_SEND_DELAY
+                else:
+                    timeout = STATE_PUBLISH_FREQUENCY / 2
+                try:
+                    pubtype, topic, payload = self.publishqueue.get(timeout=timeout)
+                except queue.Empty:
+                    if homiedelayed:
+                        pubtype = "homie"
+                        topic, payload = homiedelayed.pop(0)
+                    else:
+                        pubtype = None
+                if pubtype == "blinds":
+                    self.client.publish(f"blinds/{topic}/position", payload)
+                elif pubtype == "homie":
+                    if (time.time() - lasthomiesend) < HOMIE_SEND_DELAY:
+                        print("Sending homie too fast, delaying...", homiedelayed)
+                        homiedelayed.append((topic, payload))
+                    else:
+                        self.client.publish(f"homie/{topic}/command/send/set", payload)
+                        lasthomiesend = time.time()
+
+                if time.time() > self.next_state_publish:
+                    self.publishhomiestate()
+                    self.next_state_publish = time.time() + STATE_PUBLISH_FREQUENCY
+
+            except Exception as e:
+                logerror(f"Error in publishing loop: {e}")
+                time.sleep(5)
+
+    def publishhomiestate(self):
+        """Publish the state of all the Homie devices for HA"""
+        for homie_id, state in self.homie_state.items():
+            self.client.publish(f"blinds/homie/{homie_id}/state", json.dumps(state))
+
+    def onmqttconnect(self, client, userdata, flags, rc):
+        for homie_id in self.homie_ids:
+            self.client.subscribe(f"homie/{homie_id}/#")
+            print(f"homie/{homie_id}/#")
+        self.client.subscribe("blinds/+/#")
+
+    def onmqttmessage(self, client, userdata, msg):
+        try:
+            parts = msg.topic.split("/")
+            payload = msg.payload.decode()
+            if parts[0] == "homie":
+                if parts[-1] == "received":
+                    command, remote_id, channel = parsepayload(payload)
+                    if channel == 0:
+                        # find all potential channels on this remote
+                        keys = []
+                        for channel in range(1, 16):
+                            keys.append(blindkey(remote_id, channel))
+                    else:
+                        keys = [blindkey(remote_id, channel)]
+                    for key in keys:
+                        if key not in self.blinds:
+                            continue
+                        blind = self.blinds[key]
+                        blind.gotremotecommand(command)
+                elif parts[2].startswith("$"):
+                    # It's a type of state field, see if we want it and update the status
+                    keystr = "/".join(parts[2:])
+                    if keystr in HOMIE_STATE_KEYS and parts[1] in self.homie_state:
+                        self.homie_state[parts[1]][HOMIE_STATE_KEYS[keystr]] = payload
+
+            elif parts[0] == "blinds":
+                if parts[-1] == "set":
+                    topic = parts[1]
+                    if topic not in self.blindsbytopic:
+                        return
+                    if parts[-2] == "position":
+                        # Take some action with this blind
+                        blind = self.blindsbytopic[topic]
+                        percentage = int(payload)
+                        blind.gotmqttcommand(percentage)
+                    elif parts[-2] == "command":
+                        # Take some action with this blind
+                        blind = self.blindsbytopic[topic]
+                        payload = payload.upper()
+                        if payload == "CLOSE":
+                            blind.gotmqttcommand(0)
+                        elif payload == "OPEN":
+                            blind.gotmqttcommand(100)
+                        elif payload == "STOP":
+                            blind.gotmqttcommand(None)
+
+        except Exception as e:
+            logerror(
+                f"Error with topic: {msg.topic}, payload: {msg.payload}: {e} ({e!r})"
+            )
+
+    def publishhomie(self, homie_id, payload):
+        self.publishqueue.put(("homie", homie_id, payload))
+
+    def publishblinds(self, topic, position):
+        self.publishqueue.put(("blinds", topic, int(position)))
+
+
+def readconfig():
+    config = json.load(open("./config.json"))
+    return config
+
+
+def main():
+    config = readconfig()
+    manager = BlindManager(config)
+    manager.run()
+
+
+if __name__ == "__main__":
+    main()
