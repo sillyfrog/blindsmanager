@@ -21,7 +21,7 @@ COMMANDS = [DOWN, UP, STOP, LIMIT, DIRECTION]
 FROM_REMOTE = "fromremote"
 FROM_MQTT = "frommqtt"
 
-HOMIE_SEND_DELAY = 0.5
+HOMIE_SEND_DELAY = 0  # 0.5
 
 HOMIE_STATE_KEYS = {
     "$homie": "Homie ESP Version",
@@ -227,6 +227,7 @@ class BlindManager:
             self.homie_state[homie_id] = {}
         self.publishqueue = queue.SimpleQueue()
         self.next_state_publish = time.time() + STATE_PUBLISH_FREQUENCY
+        self.ignorereceived = config.get("ignorereceived", False)
 
     def run(self):
         self.client = paho.mqtt.client.Client()
@@ -318,6 +319,8 @@ class BlindManager:
             payload = msg.payload.decode()
             if parts[0] == "homie":
                 if parts[-1] == "received":
+                    if self.ignorereceived:
+                        return
                     command, remote_id, channel = parsepayload(payload)
                     if channel == 0:
                         # find all potential channels on this remote

@@ -1,5 +1,6 @@
 {
   "host": "mqtt.server",
+  "ignorereceived": false,
   "blinds": [
     {
       "name": "Lounge 1",
