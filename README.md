@@ -26,6 +26,6 @@ There are 2 top level keys, `host` and `blinds`. `host` is just the host name of
 
 ## Running
 
-Once a valid `config.json` has been created, run the script. If not running in Docker, it will required Python 3.7 and the [PAHO MQTT](https://pypi.org/project/paho-mqtt/) module to be installed. The included `Dockerfile` shows how I build and run the script.
+Once a valid `config.json` has been created, run the script. If not running in Docker, it will require Python 3.7 and the [PAHO MQTT](https://pypi.org/project/paho-mqtt/) module to be installed. The included `Dockerfile` shows how I build and run the script.
 
 When it loads for the first time, all required `homeassistant/*` topics will be published for HA to discover the blinds. Communication on the HA side is done with a MQTT topic base of `blinds/*`. It will also subscribe to the relevant `homie/*` topics to know the status of the blinds, and to publish events to.

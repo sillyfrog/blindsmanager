@@ -21,7 +21,7 @@ COMMANDS = [DOWN, UP, STOP, LIMIT, DIRECTION]
 FROM_REMOTE = "fromremote"
 FROM_MQTT = "frommqtt"
 
-HOMIE_SEND_DELAY = 0  # 0.5
+HOMIE_SEND_DELAY = 0
 
 HOMIE_STATE_KEYS = {
     "$homie": "Homie ESP Version",
@@ -201,7 +201,7 @@ class Blind:
             "payload_available": "true",
             "payload_not_available": "false",
             "unique_id": f"blinds_{self.topic}",
-            "device": {"identifiers": [self.homie_id]},
+            # "device": {"identifiers": [self.homie_id]},
             "json_attributes_topic": f"blinds/homie/{self.homie_id}/state",
         }
         return config
@@ -249,7 +249,7 @@ class BlindManager:
                 f"homeassistant/sensor/blinds/{homie_id}/config",
                 json.dumps(
                     {
-                        "name": f"Blind controller status ({homie_id})",
+                        "name": f"Blind controller signal ({homie_id})",
                         "state_topic": f"homie/{homie_id}/$stats/signal",
                         "availability_topic": f"homie/{homie_id}/$online",
                         "payload_available": "true",
